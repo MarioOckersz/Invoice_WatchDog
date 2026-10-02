@@ -100,7 +100,7 @@ python -m src.cli --file data/sample_invoice_1.png
 ---
 
 ## 📊 Sample Output Report
-
+```
 ==================================================
 🛡️ INVOICE_WATCHDOG ANALYSIS REPORT
 ==================================================
@@ -122,7 +122,7 @@ Total Stated  : Rs. 14,500.00
 ⛓️ Secure Hash: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 🔒 Chain Integrity: VERIFIED (No tampering detected)
 ==================================================
-
+```
 ---
 
 ## 💡 Tech Stack Overview
