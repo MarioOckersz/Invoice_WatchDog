@@ -1,0 +1,20 @@
+# Environment variables containing sensitive API keys
+.env
+
+# Python bytecode and cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Local databases (don't commit customer/test invoice data to git)
+*.db
+*.sqlite3
+
+# OS metadata
+.DS_Store
+Thumbs.db
