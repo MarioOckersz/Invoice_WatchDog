@@ -53,7 +53,7 @@ Invoice_WatchDog cleanly separates fuzzy AI interpretation from strict, determin
 ---
 
 ## 📂 Project Repository Structure
-
+```
 invoice_watchdog/
 │
 ├── .env.example            # Template for your Gemini API key
@@ -78,7 +78,7 @@ invoice_watchdog/
     ├── __init__.py
     ├── test_validator.py
     └── test_ledger.py
-
+```
 ---
 
 ## 🛠️ Quick Start Guide
