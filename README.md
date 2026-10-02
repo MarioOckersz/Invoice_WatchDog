@@ -21,15 +21,14 @@ Checking these lines by hand is tedious and error-prone. Invoice_WatchDog solves
 
 ## 🏗️ System Architecture & Workflow
 
-Invoice_WatchDog cleanly separates fuzzy AI interpretation from strict, deterministic financial logic:
-
+```
  📄 Input Invoice (PNG/JPG/PDF)
          │
          ▼
  🤖 parser.py ──> Gemini Vision API (Forces strict JSON Schema)
          │
          ▼
- ⚖ validator.py ──> Plain Python Business Checks:
+ ⚖️ validator.py ──> Plain Python Business Checks:
          │              • Math validation (Σ line items = total)
          │              • Duplicate invoice detection
          │              • Price jump alerts (>15% inflation check)
