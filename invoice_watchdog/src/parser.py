@@ -1,225 +1,236 @@
 """
-parser.py - Multimodal Invoice Extractor with Exponential Backoff
-================================================================
+src/parser.py
+=============
+Purpose:
+    Robust, fault-tolerant multimodal invoice extractor for Invoice_WatchDog.
+    Converts unstructured supplier documents (images or PDFs) into strictly 
+    typed Pydantic Python structures using Google's Gemini models.
 
-PURPOSE:
---------
-Extract structured supplier data from unstructured receipts (images/PDFs)
-using Google's multimodal Gemini model.
+Key Architectural Decisions:
+    1. Separation of Concerns (Extraction vs. Auditing):
+       This file is strictly an extraction interface. It does NOT validate 
+       arithmetic, calculate discounts, or determine fraud. Offloading math 
+       to an LLM introduces non-deterministic hallucination risks.
 
-ENGINEERING PRINCIPLES APPLIED:
---------------------------------
-1. Separation of Concerns:
-   This module handles EXTRACTION ONLY. It never performs business math,
-   auditing, or fraud detection. AI is treated as a probabilistic parser;
-   deterministic Python code in downstream modules handles validation.
+    2. Transcribe, Never Compute ("Scan, Don't Think"):
+       Prompts and Field descriptions explicitly forbid the model from computing
+       totals (e.g. calculating qty * unit_price). If the original paper has an 
+       intentional or erroneous math defect, we need the raw error preserved 
+       so our downstream Python validator can flag it.
 
-2. Transcribe, Never Compute:
-   Prompts and field descriptions strictly instruct the model to copy 
-   printed numbers as-is. If the LLM "corrects" a line item calculation,
-   fraudulent or erroneous invoices would bypass audit checks.
+    3. Multi-Engine Cascade (503 & 429 Resilience):
+       Free-tier endpoints and cutting-edge preview models regularly throw 
+       transient errors (HTTP 503 Service Unavailable / HTTP 429 Rate Limits).
+       To prevent service downtime, the extractor iterates through a priority list 
+       of candidate models (e.g., gemini-3.8-flash -> gemini-2.0-flash -> gemini-1.5-flash).
+       If an endpoint is throttled or saturated, execution automatically cascades 
+       to the next available model.
 
-3. Transient File Lifecycle:
-   Customer financial documents uploaded via Google's Files API are
-   explicitly deleted in a `finally` block, ensuring no persistent copies
-   remain on external infrastructure.
-
-4. Fault Tolerance via Exponential Backoff:
-   Network requests to LLM endpoints frequently hit transient 503 (server
-   overloaded) and 429 (rate-limit) errors. A retry loop with backoff prevents
-   intermittent service hiccups from crashing the pipeline.
+    4. Transient Artifact Lifecycle (Privacy & Hygiene):
+       Files sent to Google's Files API are tracked and guaranteed to be deleted 
+       via a try/finally block, ensuring zero persistent customer financial 
+       data lingers on remote storage.
 """
 
 import os
 import time
 from typing import List, Optional
 
-# Official Google GenAI SDK and internal error types
+# Google GenAI modern SDK imports
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
 
-# Pydantic handles runtime data parsing, validation, and schema generation
+# Pydantic is utilized to enforce strict typing and build the JSON response schema
 from pydantic import BaseModel, Field
 
-# Centralized configuration keeps keys and model identifiers out of application logic
-from src.config import GEMINI_API_KEY, GEMINI_MODEL
+# Centralized configuration containing API keys and candidate fallback models
+from src.config import GEMINI_API_KEY, MODEL_CANDIDATES
 
 
 # ===========================================================================
-# 1. DATA CONTRACTS (Pydantic Schemas)
+# 1. DATA CONTRACTS & JSON SCHEMAS
 # ===========================================================================
-# These models define the exact JSON structure enforced during model generation.
-# Field descriptions are passed directly to Gemini's schema parser, functioning
-# as micro-prompts that guide field-level extraction behavior.
+# Pydantic classes passed to `response_schema` are transformed by the SDK 
+# into OpenAPI-compatible JSON schemas sent directly to Gemini.
+# The Field(description=...) strings act as granular prompt instructions.
 
 class LineItem(BaseModel):
     """
-    Represents an individual line item on a supplier bill.
+    Represents an individual billed row item from the document.
+    All numeric fields default to None to prevent synthetic hallucination.
     """
     name: str = Field(
-        description="Product or service name exactly as printed on the document."
+        description="The full product description or service name exactly as printed."
     )
     quantity: Optional[float] = Field(
         default=None, 
-        description="Quantity purchased. Set to null if omitted from the bill."
+        description="The number of units billed. Null if not explicitly printed."
     )
     unit_price: Optional[float] = Field(
         default=None, 
-        description="Price per single unit. Set to null if omitted from the bill."
+        description="The price per single unit before taxes. Null if not explicitly printed."
     )
-    # CRITICAL: We instruct the model to transcribe rather than recalculate.
-    # If the supplier wrote 2 x $5 = $12 (a mistake), we want to capture $12
-    # so that our validator catches the arithmetic error.
+    # CRITICAL: We tell the model to copy what it sees, not calculate it.
+    # If the vendor printed 5 units @ $10.00 = $70.00 (a $20 error),
+    # the model MUST record total_price as 70.0, allowing our Python validator
+    # to catch the discrepancy.
     total_price: Optional[float] = Field(
         default=None, 
-        description="Line total AS PRINTED. Do not calculate (quantity * unit_price)."
+        description="Total billed amount for this specific line item AS PRINTED. Do not calculate."
     )
 
 
 class InvoiceSchema(BaseModel):
     """
-    Top-level invoice container. Captures metadata, line items, and stated totals.
+    Root document schema representing the complete parsed invoice.
+    Accommodates variations across supplier formats (tax, discounts, subtotal).
     """
     supplier_name: Optional[str] = Field(
         default=None, 
-        description="Name of the selling company or distributor. Null if unreadable."
+        description="Legal business name of the vendor or supplier as printed."
     )
     invoice_number: Optional[str] = Field(
         default=None, 
-        description="Unique invoice/bill identifier. Null if missing."
+        description="The primary invoice, reference, or bill identifier string."
     )
     date: Optional[str] = Field(
         default=None, 
-        description="Invoice date formatted as YYYY-MM-DD. Null if not specified."
+        description="Invoice issuance date formatted strictly as YYYY-MM-DD. Null if illegible."
     )
-    
-    # Required list: An invoice must contain items to be actionable.
+    # Required collection of items; defaults to an empty list if none parsed
     line_items: List[LineItem] = Field(
         default_factory=list,
-        description="List of all purchased goods or services listed on the invoice."
+        description="List containing every product or service billed on the invoice."
     )
-    
-    # Financial fields are marked Optional to handle diverse billing formats:
-    # Tax, discounts, and subtotals must be extracted separately so our validator
-    # does not misidentify standard sales tax as an arithmetic mismatch.
+    # Intermediate financial fields prevent false-positive validation flags on invoices with taxes
     subtotal: Optional[float] = Field(
         default=None, 
-        description="Subtotal before taxes or discounts, if printed."
+        description="Calculated sum of all line items before tax or deductions, if explicitly printed."
     )
     tax: Optional[float] = Field(
         default=None, 
-        description="Total tax, VAT, or GST amount, if printed."
+        description="Total sales tax, VAT, GST, or excise amount explicitly printed."
     )
     discount: Optional[float] = Field(
         default=None, 
-        description="Total discount or markdown amount, if printed."
+        description="Total promotional discount or rebate deducted from total, if explicitly printed."
     )
     total_amount: Optional[float] = Field(
         default=None, 
-        description="Final grand total AS PRINTED. Do not recalculate."
+        description="The final stated balance due or grand total AS PRINTED. Do not recalculate."
     )
 
 
 # ===========================================================================
-# 2. SYSTEM EXTRACTION PROMPT
+# 2. SYSTEM INSTRUCTIONS
 # ===========================================================================
-# The prompt reinforces passive transcription. We treat the model like an OCR
-# scanner rather than an intelligent accountant.
-
-SYSTEM_PROMPT = (
-    "Extract all information from this supplier invoice. "
-    "Copy every numerical value and description exactly as printed, "
-    "even if the arithmetic appears incorrect. "
-    "Do not calculate, correct, or infer missing figures. "
-    "If any field is absent or illegible, set its value to null."
+# Reinforces the schema boundaries: treat the model as a dumb OCR scanner.
+EXTRACTION_INSTRUCTIONS = (
+    "You are a strict data transcription engine. Extract all relevant details from this invoice. "
+    "Do not compute, adjust, balance, or guess numerical values. "
+    "Copy every single number and string exactly as printed on the document, even if the math is wrong. "
+    "If a value is not printed or cannot be determined with complete confidence, return null."
 )
 
 
 # ===========================================================================
-# 3. EXTRACTION PIPELINE WITH RETRY LOGIC
+# 3. EXTRACTION ENGINE WITH AUTOMATED CASCADE
 # ===========================================================================
 
-def parse_invoice(file_path: str, max_retries: int = 4, base_delay: float = 2.0) -> InvoiceSchema:
+def parse_invoice(file_path: str, retries_per_model: int = 2) -> InvoiceSchema:
     """
-    Uploads an invoice to Google's Files API, extracts structured fields using Gemini,
-    cleans up the remote file, and returns a validated InvoiceSchema object.
+    Uploads a document to Gemini, runs extraction across a cascade of models 
+    to mitigate 503/429 outages, cleans up remote artifacts, and returns 
+    a strongly typed InvoiceSchema instance.
 
     Args:
-        file_path (str): Local filesystem path to the target image (.png, .jpg) or PDF (.pdf).
-        max_retries (int): Number of attempts to make against transient API errors (503/429).
-        base_delay (float): Starting sleep duration in seconds for exponential backoff.
+        file_path (str): Path to local PNG, JPG, or PDF file.
+        retries_per_model (int): Retries per candidate before cascading (default: 2).
 
     Returns:
-        InvoiceSchema: Pydantic instance populated with extracted invoice data.
+        InvoiceSchema: Validated Pydantic model populated with invoice data.
 
     Raises:
-        FileNotFoundError: If the invoice file does not exist locally.
-        ValueError: If the model returns an empty or unparseable response.
-        APIError: If external API calls fail after exhausting all retries.
+        FileNotFoundError: If the source invoice file cannot be resolved.
+        RuntimeError: If all candidate models in the cascade fail.
     """
-    # 1. Fail fast on local path issues before making external network calls
+    # 1. Guard check: verify file existence locally before making remote network calls
     if not os.path.exists(file_path):
-        raise FileNotFoundError(f"Target document not found at: {file_path}")
+        raise FileNotFoundError(f"Source invoice document does not exist: {file_path}")
 
-    # 2. Instantiate the Google GenAI Client
+    # 2. Initialize the Google GenAI SDK client with validated environment key
     client = genai.Client(api_key=GEMINI_API_KEY)
 
     print(f"[*] Uploading '{file_path}' to Google Files API...")
-    # The Files API handles documents and images natively without manual pre-processing
-    uploaded_file = client.files.upload(file=file_path)
+    # The Files API handles both raster images and multi-page PDFs natively
+    uploaded_artifact = client.files.upload(file=file_path)
 
-    # 3. try/finally block guarantees remote file deletion even if execution fails
+    # 3. Wrapping the processing in try/finally ensures that no matter what fails,
+    # uploaded customer data is wiped from Google's temporary file storage.
     try:
-        current_delay = base_delay
+        last_encountered_error = None
 
-        for attempt in range(1, max_retries + 1):
-            try:
-                print(f"[*] Querying {GEMINI_MODEL} (Attempt {attempt}/{max_retries})...")
+        # --- CASCADE LOOP: Iterate through fallback models ---
+        for model_identifier in MODEL_CANDIDATES:
+            print(f"[*] Dispatching extraction job to engine: '{model_identifier}'...")
+            
+            backoff_delay = 2.0  # Initial sleep time in seconds for exponential backoff
 
-                response = client.models.generate_content(
-                    model=GEMINI_MODEL,
-                    contents=[uploaded_file, SYSTEM_PROMPT],
-                    config=types.GenerateContentConfig(
-                        # Enforce pure JSON output format
-                        response_mime_type="application/json",
-                        # Bind the output directly to our Pydantic class
-                        response_schema=InvoiceSchema,
-                        # Temperature 0.0 maximizes determinism and minimizes hallucination
-                        temperature=0.0,
-                    ),
-                )
-
-                # Validate that the response contains structured output
-                if response.parsed is None:
-                    raise ValueError(
-                        "Model returned an empty payload or failed to conform to schema."
+            for attempt in range(1, retries_per_model + 1):
+                try:
+                    # Invoke multimodal model with strict schema enforcement
+                    response = client.models.generate_content(
+                        model=model_identifier,
+                        contents=[uploaded_artifact, EXTRACTION_INSTRUCTIONS],
+                        config=types.GenerateContentConfig(
+                            # Force the model to output valid JSON matching our Pydantic structure
+                            response_mime_type="application/json",
+                            response_schema=InvoiceSchema,
+                            # Temperature 0.0 guarantees deterministic extraction (no creative variation)
+                            temperature=0.0,
+                        ),
                     )
 
-                # Return the validated Pydantic model directly
-                return response.parsed
+                    # Ensure the SDK successfully parsed the payload into an InvoiceSchema instance
+                    if response.parsed is not None:
+                        print(f"✅ Extraction completed successfully using '{model_identifier}'.")
+                        return response.parsed
+                    
+                    # If response.parsed is None, the output may have been blocked or truncated
+                    print(f"⚠ Engine '{model_identifier}' returned an empty or unparseable payload.")
+                    break
 
-            except APIError as err:
-                # 503 = Service Unavailable / Transient High Demand
-                # 429 = Rate Limit Exceeded
-                is_transient = err.code in (503, 429)
+                except APIError as api_err:
+                    last_encountered_error = api_err
+                    
+                    # Check for transient server saturation (503) or rate-limiting (429)
+                    if api_err.code in (503, 429):
+                        print(f"⚠ Engine '{model_identifier}' capacity error {api_err.code}: {api_err.message}")
+                        if attempt < retries_per_model:
+                            print(f"  Attempt {attempt}/{retries_per_model} failed. Waiting {backoff_delay:.1f}s before retry...")
+                            time.sleep(backoff_delay)
+                            backoff_delay *= 2.0  # Double delay for subsequent retry
+                        else:
+                            print(f"  Max attempts reached for '{model_identifier}'.")
+                    else:
+                        # Non-transient error (e.g. 404 Model Not Found, 400 Bad Request)
+                        print(f"⚠ Engine '{model_identifier}' cannot be used: {api_err.message}")
+                        break  # Immediately stop retrying this model and advance to next candidate
 
-                if is_transient and attempt < max_retries:
-                    print(f"⚠ Server returned code {err.code} ({err.message}).")
-                    print(f"  Backing off for {current_delay:.1f}s before retry...")
-                    time.sleep(current_delay)
-                    current_delay *= 2.0  # Exponential backoff progression: 2s, 4s, 8s...
-                else:
-                    # Non-recoverable error (e.g., 400 Bad Request, 401 Unauthorized) or out of retries
-                    raise err
+            print(f"🔄 Cascading to next available backup model in configuration...")
 
-        raise RuntimeError(f"Failed to process invoice after {max_retries} attempts.")
+        # If the loop exhausts all models in MODEL_CANDIDATES without returning:
+        raise RuntimeError(
+            f"All available engine candidates failed to extract data. Last error encountered: {last_encountered_error}"
+        )
 
     finally:
-        # Secure audit hygiene: never leave customer financial files sitting on remote servers
-        print(f"[*] Cleaning up remote artifact '{uploaded_file.name}' from Google storage...")
+        # --- CLEANUP GUARANTEE ---
+        # Irrespective of success or raised exceptions, purge the uploaded document from Google servers
+        print(f"[*] Purging transient artifact '{uploaded_artifact.name}' from Google storage...")
         try:
-            client.files.delete(name=uploaded_file.name)
+            client.files.delete(name=uploaded_artifact.name)
         except Exception as cleanup_err:
-            # File cleanup failure should warn but not mask prior extraction errors
-            print(f"⚠ Warning: Could not delete remote file '{uploaded_file.name}': {cleanup_err}")
+            # File deletion failure should notify but not override primary pipeline exceptions
+            print(f"⚠ Warning: Failed to purge remote file '{uploaded_artifact.name}': {cleanup_err}")
